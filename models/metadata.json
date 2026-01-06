@@ -1,0 +1,13 @@
+{
+  "created_at": "2026-01-03T15:33:42.669262",
+  "sequence_length": 24,
+  "features_count": 20,
+  "train_samples": 5037,
+  "test_samples": 1260,
+  "test_accuracy": 0.9531746031746032,
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT"
+  ]
+}

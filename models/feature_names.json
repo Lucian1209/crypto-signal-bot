@@ -1,0 +1,22 @@
+[
+  "open",
+  "high",
+  "low",
+  "close",
+  "volume",
+  "rsi",
+  "macd",
+  "macd_signal",
+  "macd_histogram",
+  "bb_upper",
+  "bb_middle",
+  "bb_lower",
+  "ema_9",
+  "ema_21",
+  "ema_50",
+  "atr",
+  "stoch_k",
+  "stoch_d",
+  "price_change_1h",
+  "price_change_24h"
+]
