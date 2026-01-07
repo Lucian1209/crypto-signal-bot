@@ -25,28 +25,28 @@ class CoinGeckoCollector:
     def __init__(self):
         self.api_key = os.getenv("COINGECKO_API_KEY", "")
 
-        if self.api_key:
-            # Pro API endpoint
-            self.base_url = "https://pro-api.coingecko.com/api/v3"
-            logger.info("Using CoinGecko Pro API with key")
-        else:
-            # Free API endpoint
-            self.base_url = "https://api.coingecko.com/api/v3"
-            logger.info("Using CoinGecko Free API (rate limited)")
+        # Завжди використовуємо звичайний endpoint
+        # Demo API key працює з headers, не з pro endpoint
+        self.base_url = "https://api.coingecko.com/api/v3"
 
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (compatible; CryptoSignalBot/1.0)'
+            'User-Agent': 'Mozilla/5.0 (compatible; CryptoSignalBot/1.0)',
+            'Accept': 'application/json'
         })
 
         if self.api_key:
+            # Demo API key йде в header
             self.session.headers.update({
-                'X-Cg-Pro-Api-Key': self.api_key
+                'x-cg-demo-api-key': self.api_key
             })
+            logger.info("Using CoinGecko API with key")
+        else:
+            logger.info("Using CoinGecko Free API (rate limited)")
 
         # Rate limiting
         self.last_request_time = 0
-        self.min_request_interval = 1.2 if not self.api_key else 0.1  # Free: 1.2s, Pro: 0.1s
+        self.min_request_interval = 1.5 if not self.api_key else 0.5  # Free: 1.5s, With key: 0.5s
 
         # Mapping symbols to CoinGecko IDs
         self.symbol_map = {
@@ -119,6 +119,22 @@ class CoinGeckoCollector:
             }
 
             response = self.session.get(url, params=params, timeout=10)
+
+            # Log response for debugging
+            logger.debug(f"CoinGecko response status: {response.status_code}")
+
+            if response.status_code == 429:
+                logger.warning("Rate limit exceeded, waiting 60 seconds...")
+                time.sleep(60)
+                response = self.session.get(url, params=params, timeout=10)
+
+            if response.status_code == 401 and self.api_key:
+                logger.warning("API key failed (401), retrying without key...")
+                # Remove API key and retry
+                self.session.headers.pop('x-cg-demo-api-key', None)
+                self.api_key = ""
+                response = self.session.get(url, params=params, timeout=10)
+
             response.raise_for_status()
             data = response.json()
 
@@ -159,6 +175,18 @@ class CoinGeckoCollector:
 
             logger.info(f"Fetching {days_back} days of data for {symbol}...")
             response = self.session.get(url, params=params, timeout=30)
+
+            if response.status_code == 429:
+                logger.warning("Rate limit exceeded, waiting 60 seconds...")
+                time.sleep(60)
+                response = self.session.get(url, params=params, timeout=30)
+
+            if response.status_code == 401 and self.api_key:
+                logger.warning("API key failed (401), retrying without key...")
+                self.session.headers.pop('x-cg-demo-api-key', None)
+                self.api_key = ""
+                response = self.session.get(url, params=params, timeout=30)
+
             response.raise_for_status()
             data = response.json()
 
