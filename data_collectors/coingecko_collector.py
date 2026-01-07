@@ -25,8 +25,7 @@ class CoinGeckoCollector:
     def __init__(self):
         self.api_key = os.getenv("COINGECKO_API_KEY", "")
 
-        # Завжди використовуємо звичайний endpoint
-        # Demo API key працює з headers, не з pro endpoint
+        # Завжди використовуємо стандартний endpoint
         self.base_url = "https://api.coingecko.com/api/v3"
 
         self.session = requests.Session()
@@ -36,17 +35,17 @@ class CoinGeckoCollector:
         })
 
         if self.api_key:
-            # Demo API key йде в header
+            # CoinGecko Demo API key header
             self.session.headers.update({
                 'x-cg-demo-api-key': self.api_key
             })
-            logger.info("Using CoinGecko API with key")
+            logger.info("Using CoinGecko API with Demo key")
         else:
             logger.info("Using CoinGecko Free API (rate limited)")
 
         # Rate limiting
         self.last_request_time = 0
-        self.min_request_interval = 1.5 if not self.api_key else 0.5  # Free: 1.5s, With key: 0.5s
+        self.min_request_interval = 1.2 if not self.api_key else 0.1  # Free: 1.2s, Pro: 0.1s
 
         # Mapping symbols to CoinGecko IDs
         self.symbol_map = {
@@ -105,54 +104,58 @@ class CoinGeckoCollector:
         """
         Отримати поточну ціну
         """
-        try:
-            coin_id = self._get_coin_id(symbol)
+        max_retries = 3
+        retry_delay = 2
 
-            self._rate_limit()  # Apply rate limiting
+        for attempt in range(max_retries):
+            try:
+                coin_id = self._get_coin_id(symbol)
 
-            url = f"{self.base_url}/simple/price"
-            params = {
-                'ids': coin_id,
-                'vs_currencies': 'usd',
-                'include_24hr_change': 'true',
-                'include_24hr_vol': 'true'
-            }
+                self._rate_limit()  # Apply rate limiting
 
-            response = self.session.get(url, params=params, timeout=10)
+                url = f"{self.base_url}/simple/price"
+                params = {
+                    'ids': coin_id,
+                    'vs_currencies': 'usd',
+                    'include_24hr_change': 'true',
+                    'include_24hr_vol': 'true'
+                }
 
-            # Log response for debugging
-            logger.debug(f"CoinGecko response status: {response.status_code}")
-
-            if response.status_code == 429:
-                logger.warning("Rate limit exceeded, waiting 60 seconds...")
-                time.sleep(60)
                 response = self.session.get(url, params=params, timeout=10)
 
-            if response.status_code == 401 and self.api_key:
-                logger.warning("API key failed (401), retrying without key...")
-                # Remove API key and retry
-                self.session.headers.pop('x-cg-demo-api-key', None)
-                self.api_key = ""
-                response = self.session.get(url, params=params, timeout=10)
+                # Handle rate limiting
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (attempt + 1)
+                        logger.warning(f"Rate limited (429), waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        raise Exception("Rate limit exceeded, max retries reached")
 
-            response.raise_for_status()
-            data = response.json()
+                response.raise_for_status()
+                data = response.json()
 
-            if coin_id not in data:
-                raise ValueError(f"No data for {coin_id}")
+                if coin_id not in data:
+                    raise ValueError(f"No data for {coin_id}")
 
-            coin_data = data[coin_id]
+                coin_data = data[coin_id]
 
-            return {
-                'symbol': symbol,
-                'price': coin_data['usd'],
-                'change_24h': coin_data.get('usd_24h_change', 0),
-                'volume_24h': coin_data.get('usd_24h_vol', 0)
-            }
+                return {
+                    'symbol': symbol,
+                    'price': coin_data['usd'],
+                    'change_24h': coin_data.get('usd_24h_change', 0),
+                    'volume_24h': coin_data.get('usd_24h_vol', 0)
+                }
 
-        except Exception as e:
-            logger.error(f"Error getting price for {symbol}: {e}")
-            raise
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Request failed (attempt {attempt+1}/{max_retries}): {e}")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    logger.error(f"Error getting price for {symbol}: {e}")
+                    raise
 
     def get_historical_data(self, symbol: str, interval: str = "1h", days_back: int = 3) -> pd.DataFrame:
         """
@@ -161,71 +164,79 @@ class CoinGeckoCollector:
         interval: не використовується для CoinGecko (завжди погодинні дані)
         days_back: скільки днів історії
         """
-        try:
-            coin_id = self._get_coin_id(symbol)
+        max_retries = 3
+        retry_delay = 2
 
-            self._rate_limit()  # Apply rate limiting
+        for attempt in range(max_retries):
+            try:
+                coin_id = self._get_coin_id(symbol)
 
-            url = f"{self.base_url}/coins/{coin_id}/market_chart"
-            params = {
-                'vs_currency': 'usd',
-                'days': days_back,
-                'interval': 'hourly'
-            }
+                self._rate_limit()
 
-            logger.info(f"Fetching {days_back} days of data for {symbol}...")
-            response = self.session.get(url, params=params, timeout=30)
+                url = f"{self.base_url}/coins/{coin_id}/market_chart"
+                params = {
+                    'vs_currency': 'usd',
+                    'days': days_back,
+                    'interval': 'hourly'
+                }
 
-            if response.status_code == 429:
-                logger.warning("Rate limit exceeded, waiting 60 seconds...")
-                time.sleep(60)
+                logger.info(f"Fetching {days_back} days of data for {symbol}...")
                 response = self.session.get(url, params=params, timeout=30)
 
-            if response.status_code == 401 and self.api_key:
-                logger.warning("API key failed (401), retrying without key...")
-                self.session.headers.pop('x-cg-demo-api-key', None)
-                self.api_key = ""
-                response = self.session.get(url, params=params, timeout=30)
+                # Handle rate limiting
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (attempt + 1)
+                        logger.warning(f"Rate limited (429), waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        raise Exception("Rate limit exceeded, max retries reached")
 
-            response.raise_for_status()
-            data = response.json()
+                response.raise_for_status()
+                data = response.json()
 
-            # Конвертувати в DataFrame
-            prices = data.get('prices', [])
-            volumes = data.get('total_volumes', [])
+                # Конвертувати в DataFrame
+                prices = data.get('prices', [])
+                volumes = data.get('total_volumes', [])
 
-            if not prices:
-                raise ValueError(f"No price data for {symbol}")
+                if not prices:
+                    raise ValueError(f"No price data for {symbol}")
 
-            df = pd.DataFrame(prices, columns=['timestamp', 'close'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df = pd.DataFrame(prices, columns=['timestamp', 'close'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
-            # Додати volume
-            if volumes:
-                vol_df = pd.DataFrame(volumes, columns=['timestamp', 'volume'])
-                vol_df['timestamp'] = pd.to_datetime(vol_df['timestamp'], unit='ms')
-                df = df.merge(vol_df, on='timestamp', how='left')
-            else:
-                df['volume'] = 0
+                # Додати volume
+                if volumes:
+                    vol_df = pd.DataFrame(volumes, columns=['timestamp', 'volume'])
+                    vol_df['timestamp'] = pd.to_datetime(vol_df['timestamp'], unit='ms')
+                    df = df.merge(vol_df, on='timestamp', how='left')
+                else:
+                    df['volume'] = 0
 
-            # Створити OHLC з close (апроксимація)
-            df['open'] = df['close'].shift(1).fillna(df['close'])
-            df['high'] = df[['open', 'close']].max(axis=1) * 1.001  # Додати 0.1% варіації
-            df['low'] = df[['open', 'close']].min(axis=1) * 0.999
+                # Створити OHLC з close (апроксимація)
+                df['open'] = df['close'].shift(1).fillna(df['close'])
+                df['high'] = df[['open', 'close']].max(axis=1) * 1.001  # Додати 0.1% варіації
+                df['low'] = df[['open', 'close']].min(axis=1) * 0.999
 
-            # Сортувати по часу
-            df = df.sort_values('timestamp').reset_index(drop=True)
+                # Сортувати по часу
+                df = df.sort_values('timestamp').reset_index(drop=True)
 
-            # Заповнити NaN
-            df = df.fillna(method='ffill').fillna(method='bfill')
+                # Заповнити NaN
+                df = df.fillna(method='ffill').fillna(method='bfill')
 
-            logger.info(f"Got {len(df)} rows for {symbol}")
+                logger.info(f"Got {len(df)} rows for {symbol}")
 
-            return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
 
-        except Exception as e:
-            logger.error(f"Error getting historical data for {symbol}: {e}")
-            raise
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Request failed (attempt {attempt+1}/{max_retries}): {e}")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    logger.error(f"Error getting historical data for {symbol}: {e}")
+                    raise
 
     def calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """
