@@ -1,6 +1,7 @@
 """
 ML Signal Generation Service - Production Ready
-Підтримує Binance та CoinGecko (для Railway)
+Підтримує Binance, CoinGecko та CryptoCompare
+За замовчуванням використовує CryptoCompare (БЕЗ API KEY!)
 """
 
 from fastapi import FastAPI, HTTPException
@@ -47,17 +48,21 @@ logger.info(f"BASE_DIR: {BASE_DIR}")
 # IMPORTS - Dynamic data source
 # -----------------------------------------------------------------------------
 
-DATA_SOURCE = os.getenv("DATA_SOURCE", "coingecko")  # binance or coingecko
+DATA_SOURCE = os.getenv("DATA_SOURCE", "cryptocompare")  # binance, coingecko, or cryptocompare
 
 try:
     if DATA_SOURCE == "binance":
         from data_collectors.binance_collector import BinanceCollector as DataCollector
-        logger.info("✓ BinanceCollector will be used")
-    else:
+        logger.info("✓ BinanceCollector will be used (best for local)")
+    elif DATA_SOURCE == "coingecko":
         from data_collectors.coingecko_collector import CoinGeckoCollector as DataCollector
-        logger.info("✓ CoinGeckoCollector will be used")
+        logger.info("✓ CoinGeckoCollector will be used (requires API key)")
+    else:  # cryptocompare (default)
+        from data_collectors.cryptocompare_collector import CryptoCompareCollector as DataCollector
+        logger.info("✓ CryptoCompareCollector will be used (no API key needed, perfect for Railway)")
 except Exception as e:
     logger.error(f"✗ DataCollector import failed: {e}")
+    logger.exception("Full import error:")
     raise
 
 # -----------------------------------------------------------------------------
@@ -66,8 +71,8 @@ except Exception as e:
 
 app = FastAPI(
     title="Crypto Signal ML Service",
-    description="ML-powered crypto trading signal generation",
-    version="2.0.0"
+    description="ML-powered crypto trading signal generation with multiple data sources",
+    version="2.1.0"
 )
 
 # -----------------------------------------------------------------------------
@@ -100,7 +105,7 @@ class SignalResponse(BaseModel):
     timestamp: str
     technical_indicators: dict
     mode: str  # "ml" or "technical"
-    data_source: str  # "binance" or "coingecko"
+    data_source: str  # "binance", "coingecko" or "cryptocompare"
 
 # -----------------------------------------------------------------------------
 # LAZY ML LOADER
@@ -196,7 +201,7 @@ async def startup_event():
     global data_collector
 
     logger.info("=" * 70)
-    logger.info(f"STARTING SIGNAL SERVICE")
+    logger.info(f"STARTING CRYPTO SIGNAL SERVICE")
     logger.info(f"Data Source: {DATA_SOURCE}")
     logger.info("=" * 70)
 
@@ -209,10 +214,12 @@ async def startup_event():
         if hasattr(data_collector, 'test_connection'):
             if data_collector.test_connection():
                 logger.info(f"✓ {DATA_SOURCE.title()} connection test OK")
+            else:
+                logger.warning(f"⚠ {DATA_SOURCE.title()} connection test failed")
 
         # Test price fetch
         test = data_collector.get_current_price("BTCUSDT")
-        logger.info(f"✓ Test price fetch OK: BTC = ${test['price']}")
+        logger.info(f"✓ Test price fetch OK: BTC = ${test['price']:,.2f}")
 
     except Exception as e:
         logger.error(f"✗ Data collector init failed: {e}")
@@ -226,8 +233,24 @@ async def startup_event():
 # HEALTH
 # -----------------------------------------------------------------------------
 
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "service": "Crypto Signal ML Service",
+        "version": "2.1.0",
+        "status": "running",
+        "data_source": DATA_SOURCE,
+        "endpoints": {
+            "health": "/health",
+            "predict": "/predict (POST)",
+            "docs": "/docs"
+        }
+    }
+
 @app.get("/health")
 async def health():
+    """Health check endpoint"""
     return {
         "status": "ok",
         "data_source": DATA_SOURCE,
@@ -235,7 +258,7 @@ async def health():
         "ml_load_attempted": ml_load_attempted,
         "ml_loaded": ml_loaded,
         "ml_available": model is not None and scaler is not None and feature_names is not None,
-        "mode": "ml" if (model and scaler and feature_names) else "technical"
+        "mode": "ml" if (model and scaler and feature_names) else "technical_analysis"
     }
 
 # -----------------------------------------------------------------------------
@@ -244,6 +267,16 @@ async def health():
 
 @app.post("/predict", response_model=SignalResponse)
 async def predict(request: SignalRequest):
+    """
+    Generate trading signal for given symbol
+
+    Args:
+        symbol: Trading pair (e.g., BTCUSDT, ETHUSDT)
+        interval: Timeframe (1h, 4h, 1d, etc.)
+
+    Returns:
+        SignalResponse with action (BUY/SELL), confidence, prices, and indicators
+    """
     try:
         symbol = request.symbol.upper()
         logger.info("=" * 70)
@@ -262,6 +295,9 @@ async def predict(request: SignalRequest):
         )
         logger.info(f"✓ Got {len(df)} data rows")
 
+        if len(df) < 30:
+            raise HTTPException(400, f"Not enough data: got {len(df)} rows, need at least 30")
+
         logger.info("Calculating technical indicators...")
         df = data_collector.calculate_technical_indicators(df)
         logger.info("✓ Technical indicators calculated")
@@ -269,10 +305,10 @@ async def predict(request: SignalRequest):
         logger.info("Fetching current price...")
         price_data = data_collector.get_current_price(symbol)
         current_price = float(price_data["price"])
-        logger.info(f"✓ Current price: ${current_price}")
+        logger.info(f"✓ Current price: ${current_price:,.2f}")
 
         # Generate signal
-        logger.info("Attempting to load ML model...")
+        logger.info("Determining signal generation method...")
         ml_ready = load_ml_model()
 
         if ml_ready:
@@ -288,11 +324,11 @@ async def predict(request: SignalRequest):
 
         # Risk management
         if signal["action"] == "BUY":
-            stop_loss = current_price * 0.97
-            take_profit = current_price * 1.05
+            stop_loss = current_price * 0.97   # -3%
+            take_profit = current_price * 1.05  # +5%
         else:
-            stop_loss = current_price * 1.03
-            take_profit = current_price * 0.95
+            stop_loss = current_price * 1.03   # +3%
+            take_profit = current_price * 0.95  # -5%
 
         latest = df.iloc[-1]
 
@@ -333,6 +369,7 @@ async def predict(request: SignalRequest):
 # -----------------------------------------------------------------------------
 
 def predict_with_ml(df: pd.DataFrame) -> dict:
+    """ML-based prediction using trained model"""
     try:
         sequence_length = 24
 
@@ -380,6 +417,7 @@ def predict_with_ml(df: pd.DataFrame) -> dict:
 # -----------------------------------------------------------------------------
 
 def predict_with_technical_analysis(df: pd.DataFrame) -> dict:
+    """Technical analysis-based prediction (fallback when ML unavailable)"""
     try:
         latest = df.iloc[-1]
         rsi = latest.get("rsi", 50)
