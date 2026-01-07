@@ -1,5 +1,6 @@
 """
-ML Signal Generation Service - Lightweight version with better error handling
+ML Signal Generation Service - Production Ready
+Підтримує Binance та CoinGecko (для Railway)
 """
 
 from fastapi import FastAPI, HTTPException
@@ -43,14 +44,20 @@ sys.path.append(str(BASE_DIR))
 logger.info(f"BASE_DIR: {BASE_DIR}")
 
 # -----------------------------------------------------------------------------
-# IMPORTS
+# IMPORTS - Dynamic data source
 # -----------------------------------------------------------------------------
 
+DATA_SOURCE = os.getenv("DATA_SOURCE", "coingecko")  # binance or coingecko
+
 try:
-    from data_collectors.binance_collector import BinanceCollector
-    logger.info("✓ BinanceCollector imported")
+    if DATA_SOURCE == "binance":
+        from data_collectors.binance_collector import BinanceCollector as DataCollector
+        logger.info("✓ BinanceCollector will be used")
+    else:
+        from data_collectors.coingecko_collector import CoinGeckoCollector as DataCollector
+        logger.info("✓ CoinGeckoCollector will be used")
 except Exception as e:
-    logger.error(f"✗ BinanceCollector import failed: {e}")
+    logger.error(f"✗ DataCollector import failed: {e}")
     raise
 
 # -----------------------------------------------------------------------------
@@ -60,7 +67,7 @@ except Exception as e:
 app = FastAPI(
     title="Crypto Signal ML Service",
     description="ML-powered crypto trading signal generation",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # -----------------------------------------------------------------------------
@@ -70,7 +77,7 @@ app = FastAPI(
 model = None
 scaler = None
 feature_names = None
-binance_collector = None
+data_collector = None
 ml_loaded = False
 ml_load_attempted = False
 
@@ -93,6 +100,7 @@ class SignalResponse(BaseModel):
     timestamp: str
     technical_indicators: dict
     mode: str  # "ml" or "technical"
+    data_source: str  # "binance" or "coingecko"
 
 # -----------------------------------------------------------------------------
 # LAZY ML LOADER
@@ -185,25 +193,31 @@ def load_ml_model():
 
 @app.on_event("startup")
 async def startup_event():
-    global binance_collector
+    global data_collector
 
     logger.info("=" * 70)
-    logger.info("STARTING SIGNAL SERVICE (lightweight mode)")
+    logger.info(f"STARTING SIGNAL SERVICE")
+    logger.info(f"Data Source: {DATA_SOURCE}")
     logger.info("=" * 70)
 
-    # Тільки BinanceCollector на старті
+    # Ініціалізувати data collector
     try:
-        binance_collector = BinanceCollector()
-        logger.info("✓ BinanceCollector initialized")
+        data_collector = DataCollector()
+        logger.info(f"✓ {DATA_SOURCE.title()} Collector initialized")
 
-        # Test
-        test = binance_collector.get_current_price("BTCUSDT")
-        logger.info(f"✓ Binance test OK: BTC = ${test['price']}")
+        # Test connection
+        if hasattr(data_collector, 'test_connection'):
+            if data_collector.test_connection():
+                logger.info(f"✓ {DATA_SOURCE.title()} connection test OK")
+
+        # Test price fetch
+        test = data_collector.get_current_price("BTCUSDT")
+        logger.info(f"✓ Test price fetch OK: BTC = ${test['price']}")
 
     except Exception as e:
-        logger.error(f"✗ Binance init failed: {e}")
+        logger.error(f"✗ Data collector init failed: {e}")
         logger.error(traceback.format_exc())
-        raise RuntimeError(f"Cannot start without Binance: {e}")
+        raise RuntimeError(f"Cannot start without data collector: {e}")
 
     logger.info("✓ SERVICE STARTED (ML will load on first request)")
     logger.info("=" * 70)
@@ -216,10 +230,12 @@ async def startup_event():
 async def health():
     return {
         "status": "ok",
-        "binance_ready": binance_collector is not None,
+        "data_source": DATA_SOURCE,
+        "data_collector_ready": data_collector is not None,
         "ml_load_attempted": ml_load_attempted,
         "ml_loaded": ml_loaded,
-        "ml_available": model is not None and scaler is not None and feature_names is not None
+        "ml_available": model is not None and scaler is not None and feature_names is not None,
+        "mode": "ml" if (model and scaler and feature_names) else "technical"
     }
 
 # -----------------------------------------------------------------------------
@@ -233,13 +249,13 @@ async def predict(request: SignalRequest):
         logger.info("=" * 70)
         logger.info(f"NEW REQUEST: {symbol} | {request.interval}")
 
-        if binance_collector is None:
-            logger.error("Binance collector not available!")
-            raise HTTPException(503, "Binance not available")
+        if data_collector is None:
+            logger.error("Data collector not available!")
+            raise HTTPException(503, "Data collector not available")
 
         # Get data
         logger.info("Fetching historical data...")
-        df = binance_collector.get_historical_data(
+        df = data_collector.get_historical_data(
             symbol=symbol,
             interval=request.interval,
             days_back=3
@@ -247,11 +263,11 @@ async def predict(request: SignalRequest):
         logger.info(f"✓ Got {len(df)} data rows")
 
         logger.info("Calculating technical indicators...")
-        df = binance_collector.calculate_technical_indicators(df)
+        df = data_collector.calculate_technical_indicators(df)
         logger.info("✓ Technical indicators calculated")
 
         logger.info("Fetching current price...")
-        price_data = binance_collector.get_current_price(symbol)
+        price_data = data_collector.get_current_price(symbol)
         current_price = float(price_data["price"])
         logger.info(f"✓ Current price: ${current_price}")
 
@@ -295,7 +311,8 @@ async def predict(request: SignalRequest):
                 "ema_9": float(latest.get("ema_9", 0)),
                 "ema_21": float(latest.get("ema_21", 0)),
             },
-            mode=mode
+            mode=mode,
+            data_source=DATA_SOURCE
         )
 
         logger.info("✓ REQUEST COMPLETED SUCCESSFULLY")
@@ -372,29 +389,55 @@ def predict_with_technical_analysis(df: pd.DataFrame) -> dict:
         logger.info(f"Technical indicators: RSI={rsi:.2f}, MACD={macd:.4f}")
 
         score = 0
+        reasons = []
+
+        # RSI analysis
         if rsi < 30:
             score += 2
+            reasons.append("RSI oversold")
             logger.info("RSI < 30: +2 (oversold)")
         elif rsi > 70:
             score -= 2
+            reasons.append("RSI overbought")
             logger.info("RSI > 70: -2 (overbought)")
+        elif rsi < 45:
+            score += 1
+            reasons.append("RSI low")
+        elif rsi > 55:
+            score -= 1
+            reasons.append("RSI high")
 
+        # MACD analysis
         if macd > macd_signal:
             score += 1
+            reasons.append("MACD bullish")
             logger.info("MACD > Signal: +1 (bullish)")
         else:
             score -= 1
+            reasons.append("MACD bearish")
             logger.info("MACD < Signal: -1 (bearish)")
 
+        # EMA trend
+        ema_9 = latest.get("ema_9", 0)
+        ema_21 = latest.get("ema_21", 0)
+        if ema_9 > ema_21:
+            score += 1
+            reasons.append("EMA uptrend")
+        else:
+            score -= 1
+            reasons.append("EMA downtrend")
+
         action = "BUY" if score >= 2 else "SELL"
-        confidence = min(0.6 + abs(score) * 0.1, 0.95)
+        confidence = min(0.5 + abs(score) * 0.1, 0.95)
+
+        analysis = f"Score={score} ({', '.join(reasons)}), RSI={rsi:.1f}"
 
         logger.info(f"Final score: {score} -> {action} (confidence: {confidence:.2f})")
 
         return {
             "action": action,
             "confidence": confidence,
-            "analysis": f"Technical score={score}, RSI={rsi:.1f}"
+            "analysis": analysis
         }
 
     except Exception as e:
@@ -408,4 +451,5 @@ def predict_with_technical_analysis(df: pd.DataFrame) -> dict:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
+    port = int(os.getenv("PORT", 8001))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
