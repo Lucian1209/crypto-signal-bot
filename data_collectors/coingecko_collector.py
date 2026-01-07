@@ -9,6 +9,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import logging
 import time
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -22,11 +23,30 @@ class CoinGeckoCollector:
     """
 
     def __init__(self):
-        self.base_url = "https://api.coingecko.com/api/v3"
+        self.api_key = os.getenv("COINGECKO_API_KEY", "")
+
+        if self.api_key:
+            # Pro API endpoint
+            self.base_url = "https://pro-api.coingecko.com/api/v3"
+            logger.info("Using CoinGecko Pro API with key")
+        else:
+            # Free API endpoint
+            self.base_url = "https://api.coingecko.com/api/v3"
+            logger.info("Using CoinGecko Free API (rate limited)")
+
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (compatible; CryptoSignalBot/1.0)'
         })
+
+        if self.api_key:
+            self.session.headers.update({
+                'X-Cg-Pro-Api-Key': self.api_key
+            })
+
+        # Rate limiting
+        self.last_request_time = 0
+        self.min_request_interval = 1.2 if not self.api_key else 0.1  # Free: 1.2s, Pro: 0.1s
 
         # Mapping symbols to CoinGecko IDs
         self.symbol_map = {
@@ -48,6 +68,15 @@ class CoinGeckoCollector:
         }
 
         logger.info("CoinGecko Collector initialized")
+
+    def _rate_limit(self):
+        """Ensure we don't exceed rate limits"""
+        elapsed = time.time() - self.last_request_time
+        if elapsed < self.min_request_interval:
+            sleep_time = self.min_request_interval - elapsed
+            logger.debug(f"Rate limiting: sleeping {sleep_time:.2f}s")
+            time.sleep(sleep_time)
+        self.last_request_time = time.time()
 
     def _get_coin_id(self, symbol: str) -> str:
         """Конвертує BTCUSDT -> bitcoin"""
@@ -78,6 +107,8 @@ class CoinGeckoCollector:
         """
         try:
             coin_id = self._get_coin_id(symbol)
+
+            self._rate_limit()  # Apply rate limiting
 
             url = f"{self.base_url}/simple/price"
             params = {
@@ -116,6 +147,8 @@ class CoinGeckoCollector:
         """
         try:
             coin_id = self._get_coin_id(symbol)
+
+            self._rate_limit()  # Apply rate limiting
 
             url = f"{self.base_url}/coins/{coin_id}/market_chart"
             params = {
@@ -217,6 +250,7 @@ class CoinGeckoCollector:
     def test_connection(self) -> bool:
         """Тест підключення"""
         try:
+            self._rate_limit()
             url = f"{self.base_url}/ping"
             response = self.session.get(url, timeout=5)
             return response.status_code == 200
